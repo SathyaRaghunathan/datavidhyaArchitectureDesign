@@ -52,20 +52,34 @@ H3 vs geohash
 
     Sathya's thoughts 
         1. For 50,000 parking spots updating every 30 seconds, (50000/30) = 1667 events per second and if each payload is roughly 1kb (assuming deviceID, timestamp, status, geohash/h3 index) then you have 1.6 mb/s.
-        You need architecture that decouples ingestion from storage
+        You need architecture that decouples ingestion from storage. Updates via MQTT or HTTP Post
 
-        Suggestion A: AWS Kinesis Data Streams
-            Kinesis scales via "shards". A single kinesis shard can handle up to 1MB/s or 1000 writes per second.
-            For 1667 eps, that 1.6 MB/s so we need two shards and we have some headroom. Pair Kinesis with AWS Kinesis Data Firehose. Firehose natively consumes from the stream, batches data either by time (60 seconds) or size (5 MB), converts it to a columnar format like parquet and writes it directly to Amazon S3 (your landing layer)
+            MQTT - iOT interaction protocol based on publish/subscribe model. It is over TCP and uses SSL/TLS for security. For messaging between server it uses CONNECT, PUBLISH, SUBSCRIBE, DISCONNECT.
 
-        Suggestion B: Azure Event Hubs
-            Event Hubs scales using Throughput Units, where 1 TU is 1MB/s so 1000 events/sec. We would provision 2 TUs. Enable the Capture feature on Event Hubs, this automatically streams the incoming sensor daat directly into Azure Blob Storage or Azure Data Lake Storage (ADLS) Gen2 in Avro or Parquet format with zero code.
+            HTTP - used by WWW for defining how its messages are going to be transmitted and formatted. Its responsible for the action that a server has to take while sending information over the network.
 
-        Suggestion C: Cloud-agnostic Kafka or AWS MSK
-            Create a single topic (e.g. parking-sensor-events) partitioned across 2 or 3 partitions to distribute the load across brokers and alllow for parallel downstream consumption. Use the official Kafka Connect farmework with an s3,GCS or azure blobg storage sink connector. kafka connect runs as a distributed cluster of workers that pulls data from Kafka partitions and flushes it to your object store landing layer in batches.
+        2. You also need an API gateway/load balancer. 
+            This will execute TLS Termination which decrypts the payload using your SSL/TLS certificates and passes the raw HTTP traffic to your internal network.This also helps simplify networking because your internal services (running inside a secure VPC or kubernetes cluster) can communicate over standard HTTP/gRPC. 
+            
+            Token Auth (validates JWT/drops bad requests) - inspects the incoming requests headers for an authorization token (like OAuth2 JWT or an API Key). If the token signature and expiration date are invalid, it sends a 401 unauthorized status. It helps get authenticayed telemetry data entering bronze/raw data layer. An advanced API gateway can decode a valid JWT, extract metadata and inject those fields into HTTP headers before forwarding it. Your ingestion script can grab those headers and append them to the record, giving you authomated data lineage and partition keys at ingestion point.
+            
+            Rate limiting (throttles spammy clients) - API gateway tracks how many requests a specific identifier makes within a time window and if someone exceeds this limit, the gateway blocks them with a "429 Too Many Requests" response. This prevents queue poisoning in case a rogue client or a buggy app update stats spamming, it keeps cloud costs predictable.
+        
+        3. Message Bus
+            Suggestion A: AWS Kinesis Data Streams
+                Kinesis scales via "shards". A single kinesis shard can handle up to 1MB/s or 1000 writes per second.
+                For 1667 eps, that 1.6 MB/s so we need two shards and we have some headroom. Pair Kinesis with AWS Kinesis Data Firehose. Firehose natively consumes from the stream, batches data either by time (60 seconds) or size (5 MB), converts it to a columnar format like parquet and writes it directly to Amazon S3 (your landing layer)
 
-        Suggestions:
-            - avoid the small file problem, if you write 1667 files every second directly to s3, your downstream query engines will grind to a halt/ Ensure your streaming ingestion tool IE. firehose, event hubs capture, kafka connect is configured to buffer/batch data and set a threshold to flush files either every 1-5 minutes or when teh file size reaches 10MB - 50MBs.
+            Suggestion B: Azure Event Hubs
+                Event Hubs scales using Throughput Units, where 1 TU is 1MB/s so 1000 events/sec. We would provision 2 TUs. Enable the Capture feature on Event Hubs, this automatically streams the incoming sensor data directly into Azure Blob Storage or Azure Data Lake Storage (ADLS) Gen2 in Avro or Parquet format with zero code.
 
-            - partioning strategy: Since parking data is temporal and spatial, partition your landing layer using Hive partition at the bucket level IE. s3://parking-data-landing/year=2026/month=06/day=12/hour=11/
-            You can even pre-calculate a course geohas or h3 index and include it in your partition path IE. s3://parking-data-landing/year=2026/month=06/day=12/h3_r4=8426/
+            Suggestion C: Cloud-agnostic Kafka or AWS MSK
+                Create 2 topics (e.g. parking-sensor-events,dead-letter-queue) partitioned across 2 or 3 partitions with 7 day rentention to distribute the load across brokers and alllow for parallel downstream consumption. Use the official Kafka Connect farmework with an s3,GCS or azure blobg storage sink connector. kafka connect runs as a distributed cluster of workers that pulls data from Kafka partitions and flushes it to your object store landing layer in batches.
+
+            Suggestions:
+                - avoid the small file problem, if you write 1667 files every second directly to s3, your downstream query engines will grind to a halt/ Ensure your streaming ingestion tool IE. firehose, event hubs capture, kafka connect is configured to buffer/batch data and set a threshold to flush files either every 1-5 minutes or when the file size reaches 10MB - 50MBs.
+
+                - partioning strategy: Since parking data is temporal and spatial, partition your landing layer using Hive partition at the bucket level IE. s3://parking-data-landing/year=2026/month=06/day=12/hour=11/
+                You can even pre-calculate a course geohas or h3 index and include it in your partition path IE. s3://parking-data-landing/year=2026/month=06/day=12/h3_r4=8426/
+
+
