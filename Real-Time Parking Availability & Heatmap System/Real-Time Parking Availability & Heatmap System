@@ -1,0 +1,71 @@
+Scenario
+You're interviewing at Google or Uber. The interviewer says:
+
+"A city has 50,000 parking spots with occupancy sensors that update every 30 seconds. Navigation apps need real-time availability to guide drivers to open spots. City planners need historical occupancy heatmaps. 5% of sensors are offline at any given time. Design the pipeline that processes sensor updates, serves real-time availability, and generates analytical heatmaps."
+
+Your Task
+Design the architecture. Your diagram should clearly show:
+
+Ingest sensor updates from 50,000+ parking spots (every 30 seconds per sensor)
+Maintain real-time availability counts per parking lot and zone
+Serve availability to navigation apps with < 5-second freshness
+Generate occupancy heatmaps using time-partitioned geospatial data
+Handle sensor failures (stuck sensors, offline sensors) gracefully
+Historical analytics — peak hours, average occupancy by zone, seasonal patterns
+Scale & Constraints
+Scale: 50,000 sensors × 2 updates/minute = 100K events/minute
+Latency: Availability updated within 5 seconds of sensor change
+Reliability: 5% of sensors are offline at any time (stale data handling)
+Geospatial: H3 or geohash indexing for zone-level aggregation
+Storage: 2 years of historical occupancy data for trend analysis
+
+
+Notes:
+
+H3 vs geohash
+
+    -As a data engineer dealing with geospatial data at scale, you quickly realize that traditional traditional $X/Y$ (latitude/longitude) indexing with B-Trees or R-Trees starts to fall apart when you're hitting billions of rows or trying to run massive spatial joins. Truncating floats or doing bounding-box queries over geometry types is computationally expensive and nightmare-fuel for parallel processing frameworks like Spark or Trino.To solve this, we discretize the globe into a grid, effectively turning a heavy spatial problem into a highly performant string or integer lookup problem.Two of the most dominant spatial indexing systems in modern data architecture are Geohash and Uber’s H3. Here is how they work under the hood, how they differ, and how to choose between them.
+
+1. Geohash: The Hierarchical Z-Order Curve
+    Geohash is a public-domain spatial index that bucketizes the world into a grid of rectangles (quads).
+
+    How it Works Under the Hood
+    Geohash relies on a Z-order curve (a type of space-filling curve) to map 2D coordinates into a 1D string.
+
+    It takes the Earth's coordinates and recursively bisects the latitude and longitude into binary buckets (0 or 1).
+
+    It interleaves these binary bits together (e.g., lat_bit_1, lon_bit_1, lat_bit_2, lon_bit_2).
+
+    Finally, it encodes this binary stream into a Base32 string (characters 0-9 and b-z, excluding a, i, l, o to prevent typos).
+
+    Key Engineering Characteristics
+    Hierarchical Prefix Matching: Geohashes are hierarchical. If you chop characters off the end of a Geohash string, you are widening the bounding box. For example, dr5rs is inside dr5r, which is inside dr5.
+
+    Storage Optimization: Because they are just strings, you can store them as standard text or decode them back to integers. They index beautifully in standard database B-Trees.
+
+    The Big Flaw (Edge Cases): Because it uses a square grid, Geohash suffers from severe edge-boundary discontinuities. Two points can be 10cm apart but sit on opposite sides of a major planetary quadrant boundary, resulting in completely different Geohash strings (e.g., one starts with s and the other with u).
+
+    The Distortion Flaw: High-latitude squares get heavily squished due to the convergence of meridians at the poles. A Geohash at the equator is a completely different physical area than the same length Geohash in London.
+
+2. Uber H3: 
+    The Hexagonal Discrete Global Grid SystemUber developed H3 because they needed to calculate dynamic pricing (surge) and supply/demand matching in real-time. Squares (Geohash) fail at this because the distance from the center of a square to its sides is different than the distance to its corners.H3 solves this by using Hexagons.How it Works Under the HoodH3 projects the Earth onto an icosahedron (a 20-sided polyhedron) and projects those faces onto flat surfaces optimized to minimize area distortion. It then lays out a grid of hexagons across these faces.Instead of strings, H3 indexes are 64-bit integers.It supports 16 resolution tiers (Resolution 0 down to Resolution 15, which has an average hexagon area of just $0.9 \, m^2$).Key Engineering CharacteristicsUniform Neighbor Distances: This is the holy grail for spatial analytics. The distance from the center of a hexagon to all 6 of its neighbors is exactly the same. This makes radius searches, k-ring neighbor lookups ($N$ rings out from a center point), and smoothing algorithms incredibly fast and mathematically consistent.Bit-Shifted Hierarchy: H3 is mostly hierarchical. Each higher-resolution hexagon contains roughly 7 sub-hexagons. Because you can't perfectly tile a larger hexagon with 7 smaller hexagons, the boundaries slightly overlap/rotate between resolutions. However, H3 handles this natively via optimized bit-shifting operations in its C-engine, allowing you to traverse up and down resolutions at hardware speed.High Performance: Because an H3 index is a uint64, it is incredibly cheap to store and query in columnar data warehouses like Snowflake, BigQuery, or ClickHouse.High-Level Architectural ComparisonFeatureGeohashUber H3ShapeRectangles (Quads)Hexagons (plus 12 unavoidable pentagons at vertices)Data TypeBase32 String (typically)64-bit Integer (uint64)Neighbor DistanceNon-uniform (Corners are farther than sides)Perfectly uniformHierarchyExact string prefix matching (e.g., abc $\subset$ ab)Approximate geometric containment via bitmaskingBest Used ForSimple spatial indexing, point-in-polygon caching, point matchingSpatial aggregation, routing, machine learning, clustering, radius analysisProduction Implementation: When to use which?Scenario A: Choose Geohash if...You are building a location-based classifieds site or a simple point-of-interest caching layer. If your primary query pattern is "Find all restaurants where geohash LIKE 'dr5rs%'", Geohash is great. It's cheap, human-readable in URLs, and natively supported by almost every database (Redis, Elasticsearch, DynamoDB) out of the box.Scenario B: Choose H3 if...You are doing serious data science, supply-demand modeling, aggregation, or geospatial ML.If you need to calculate the density of delivery drivers in an area, run a k-nearest-neighbors query, or aggregate millions of IoT pings into heatmaps without dealing with shape distortion, H3 is the industry standard.In Apache Spark, for example, you can write a User Defined Function (UDF) to convert (lat, lon) into an h3_index integer at ingestion. From that point on, your heavy geospatial joins become simple, lightning-fast integer JOIN operations.
+
+    Sathya's thoughts 
+        1. For 50,000 parking spots updating every 30 seconds, (50000/30) = 1667 events per second and if each payload is roughly 1kb (assuming deviceID, timestamp, status, geohash/h3 index) then you have 1.6 mb/s.
+        You need architecture that decouples ingestion from storage
+
+        Suggestion A: AWS Kinesis Data Streams
+            Kinesis scales via "shards". A single kinesis shard can handle up to 1MB/s or 1000 writes per second.
+            For 1667 eps, that 1.6 MB/s so we need two shards and we have some headroom. Pair Kinesis with AWS Kinesis Data Firehose. Firehose natively consumes from the stream, batches data either by time (60 seconds) or size (5 MB), converts it to a columnar format like parquet and writes it directly to Amazon S3 (your landing layer)
+
+        Suggestion B: Azure Event Hubs
+            Event Hubs scales using Throughput Units, where 1 TU is 1MB/s so 1000 events/sec. We would provision 2 TUs. Enable the Capture feature on Event Hubs, this automatically streams the incoming sensor daat directly into Azure Blob Storage or Azure Data Lake Storage (ADLS) Gen2 in Avro or Parquet format with zero code.
+
+        Suggestion C: Cloud-agnostic Kafka or AWS MSK
+            Create a single topic (e.g. parking-sensor-events) partitioned across 2 or 3 partitions to distribute the load across brokers and alllow for parallel downstream consumption. Use the official Kafka Connect farmework with an s3,GCS or azure blobg storage sink connector. kafka connect runs as a distributed cluster of workers that pulls data from Kafka partitions and flushes it to your object store landing layer in batches.
+
+        Suggestions:
+            - avoid the small file problem, if you write 1667 files every second directly to s3, your downstream query engines will grind to a halt/ Ensure your streaming ingestion tool IE. firehose, event hubs capture, kafka connect is configured to buffer/batch data and set a threshold to flush files either every 1-5 minutes or when teh file size reaches 10MB - 50MBs.
+
+            - partioning strategy: Since parking data is temporal and spatial, partition your landing layer using Hive partition at the bucket level IE. s3://parking-data-landing/year=2026/month=06/day=12/hour=11/
+            You can even pre-calculate a course geohas or h3 index and include it in your partition path IE. s3://parking-data-landing/year=2026/month=06/day=12/h3_r4=8426/
