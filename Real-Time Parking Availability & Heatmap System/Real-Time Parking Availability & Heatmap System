@@ -6,18 +6,29 @@ You're interviewing at Google or Uber. The interviewer says:
 Your Task
 Design the architecture. Your diagram should clearly show:
 
-Ingest sensor updates from 50,000+ parking spots (every 30 seconds per sensor)
-Maintain real-time availability counts per parking lot and zone
-Serve availability to navigation apps with < 5-second freshness
-Generate occupancy heatmaps using time-partitioned geospatial data
-Handle sensor failures (stuck sensors, offline sensors) gracefully
-Historical analytics — peak hours, average occupancy by zone, seasonal patterns
-Scale & Constraints
-Scale: 50,000 sensors × 2 updates/minute = 100K events/minute
-Latency: Availability updated within 5 seconds of sensor change
-Reliability: 5% of sensors are offline at any time (stale data handling)
-Geospatial: H3 or geohash indexing for zone-level aggregation
-Storage: 2 years of historical occupancy data for trend analysis
+    -Ingest sensor updates from 50,000+ parking spots (every 30 seconds per sensor): MQTT
+    -Maintain real-time availability counts per parking lot and zone : flink or sparkstreaming with in-memory (redis)
+    -Serve availability to navigation apps with < 5-second freshness
+    -Generate occupancy heatmaps using time-partitioned geospatial data: in Redis use geospatial lookup (sorted sets): Navigation apps querying "Find parking near me" utlizee Redis GEO command or H3 string matching
+    -Handle sensor failures (stuck sensors, offline sensors) gracefully: 1. update redis with TTL set to 90 seconds. A backgroudn worker or Flink monitors expired heartbeats and if the TTL expires, its flagged as OFFLINE. When its offline, subtract it from total active pool. If a sensor reports status:1 (occupied) continuosly for more than 48 hours without a single fluctuation, an anomaly flag is trigged via an analytical query 
+    -Historical analytics — peak hours, average occupancy by zone, seasonal patterns: This requires a long-term historical data flow with a decoupled storage pipeline
+    
+    Scale & Constraints
+    -Scale: 50,000 sensors × 2 updates/minute = 100K events/minute
+    -Latency: Availability updated within 5 seconds of sensor change
+    -Reliability: 5% of sensors are offline at any time (stale data handling)
+    -Geospatial: H3 or geohash indexing for zone-level aggregation
+    -Storage: 2 years of historical occupancy data for trend analysis
+
+    Storage & Lakehosue Architecture
+    1. Kafka connect/firehose: consumes data from kafka, batches it for 5 minutes, converts it to raw yaloads into Parquet and write to object storage
+    2. Physical partitioning Schema: partition files spatially and temporally IE. s3://parking-analytics/year=2026/month=06/day=12/h3_res4=8426/
+
+    Serving real-time heatmaps
+    -   feed the parquet files into an OLAP database like ClickHouse but because h3 indexes are stores as 64 big integers, clickhouse can aggregate millions of rows across spatial grids using fast bitwise operations to generate instantatneous map visualization layers
+
+    2 year historical analytics
+    For deep trend analysis (trainig ML church/occupancy models, evaluate seasonal patterns). Use z-order on timestamp and h3_index. To keep query performance fast over a 2 year window, a scheduled dbt or spark batch job will truncate raw data into hourly and daily summary tables.
 
 
 Notes:
