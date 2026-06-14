@@ -1,0 +1,206 @@
+Core Components
+
+Data Ingestion
+8.5
+/10
+Solid ingestion design: MQTT from sensors → API Gateway (auth + rate limiting) → Kinesis Data Streams + Firehose is a sensible AWS-native pattern. Throughput math (1.6 MB/s, 2 shards) is well-reasoned. One gap: MQTT typically uses a broker (AWS IoT Core) rather than API Gateway — IoT Core is purpose-built for sensor fleets with device shadows that help with offline/stale sensor handling. Also worth noting: no schema validation or dead-letter queue shown for malformed sensor payloads.
+
+Meets MEDIUM expectations for multi-stage ingestion with capacity planning. Using IoT Core would have pushed this to 9+.
+
+Data Processing
+8
+/10
+Flink for real-time aggregation is the right call — rolling availability counts per lot/zone fit windowed stream processing well. However, the diagram doesn't explicitly show stale sensor detection logic (10-min timeout → mark as 'unknown'), which was a core requirement of the question. Also missing: H3 indexing/enrichment step before aggregation, and how Flink computes spot → lot → zone → city rollups. Mention session windows or timers for detecting silent sensors.
+
+MEDIUM expects data quality checks and proper framework selection. Framework choice is correct; stale-sensor handling needed explicit treatment.
+
+Data Storage
+7.5
+/10
+Three storage tiers indicated (Redshift for OLAP heatmaps, Databricks/Delta Lake for trend analysis), but the diagram is missing the **real-time serving store** — Redis or DynamoDB — which is critical for the <5s freshness requirement to navigation apps. Without it, navigation apps would have to query Redshift, which is not suited for low-latency lookups. Partitioning strategy (timestamp + h3_index, Z-order) is well thought out for historical queries.
+
+MEDIUM expects multi-layered storage (raw, processed, curated, serving). The serving layer for real-time API is the notable gap.
+
+Pipeline Orchestration
+6.5
+/10
+No orchestration layer shown for the batch heatmap generation pipeline (hourly job mentioned in the prompt). Tools like Airflow, Dagster, or Databricks Workflows should be visible to schedule the heatmap tile generation, manage dependencies on partitioned Parquet data, and handle backfills. Streaming side via Flink is self-orchestrating, which is fine — but the batch side needs explicit workflow management.
+
+MEDIUM expects proper orchestration framework and dependency management. This is the weakest layer in the current design.
+
+Scalability & Performance
+8
+/10
+Capacity math is solid (100K events/min, 1.6 MB/s, 2 Kinesis shards). Partitioning by (timestamp, h3_index) with Z-order for the historical store is excellent for query performance over 2-year windows. Consider mentioning Flink parallelism keyed by lot_id or h3_index to scale aggregation. Redshift may need a materialized view or workload management for heatmap queries at scale.
+
+Meets MEDIUM expectations for horizontal scaling and resource planning.
+
+Data Governance
+6
+/10
+Authentication and rate limiting at the API Gateway are noted, but no mention of data quality metrics (e.g., what % of sensors are reporting?), data lineage, or a catalog. For a city-scale system, you'd want a dashboard showing sensor health (online/offline/stale percentages) and SLA tracking on availability freshness. Private lot access control (mentioned in hints) wasn't addressed.
+
+MEDIUM expects basic data quality monitoring and metadata management — partially present via auth, but quality/lineage missing.
+
+Advanced Considerations
+
+Technology Selection
+8
+/10
+Strong AWS-native stack (Kinesis + Firehose + Flink + Redshift) plus Databricks/Delta for analytics is coherent. Slight tension: running both Redshift and Databricks for analytical workloads adds operational overhead — could consolidate to one. MQTT → API Gateway is unconventional; AWS IoT Core would be more idiomatic.
+
+Real-time vs Batch
+7.5
+/10
+Good split: Flink handles real-time aggregation, batch (implicit) handles heatmap generation. However, the diagram doesn't clearly show the batch path branching from Firehose-written Parquet, nor the hourly heatmap job. The streaming-to-serving path lacks the Redis/DynamoDB sink for <5s freshness.
+
+Security & Compliance
+7
+/10
+API Gateway auth + rate limiting is a reasonable baseline. For a multi-tenant scenario (private lots sharing with specific apps — per the hints), would need IAM-based access control or a permissions layer at the serving tier. Encryption in transit (MQTT over TLS) and at rest (Kinesis, S3) worth calling out explicitly.
+
+Monitoring & Observability
+5.5
+/10
+No monitoring layer shown. Critical for this use case: sensor health dashboard, Flink job lag metrics, freshness SLA tracking, and alerts when offline sensor % exceeds 5% threshold. CloudWatch + Grafana or Datadog would be the natural fit.
+
+Patterns Analysis
+
+Current Patterns
+
+Kappa-leaning streaming architecture with analytical fork
+Event-driven ingestion via message bus (Kinesis)
+Time-partitioned columnar storage (Parquet) for historical queries
+Geospatial indexing via H3
+Recommended
+
+Hot/cold storage tiering (Redis hot, Delta Lake cold)
+Lambda architecture for explicit batch heatmap + streaming availability split
+Hierarchical geospatial aggregation (spot → lot → zone → city) via H3 parent indices
+Materialized view pattern in Redshift for heatmap queries
+Anti-patterns
+
+Serving navigation apps directly from Redshift (high latency, wrong tool for point lookups)
+Treating offline sensors as 'occupied' or 'available' without stale detection
+Running batch jobs without orchestration (manual/cron-based brittleness)
+Interview Readiness
+
+Key Talking Points
+
+Why Flink over Spark Streaming for low-latency windowed aggregation (true streaming vs micro-batch)
+H3 indexing and how parent/child hex relationships enable multi-zoom heatmaps
+Stale sensor handling: timer-based detection and 'unknown' state propagation
+Capacity math: 100K events/min → 2 Kinesis shards, with headroom reasoning
+Z-order partitioning for multi-dimensional query performance
+Common Questions
+
+How would you handle a sensor that's stuck reporting 'occupied' even after the car leaves?
+What if a parking lot has no sensors? How do you estimate occupancy?
+How do you prevent navigation apps from routing 10 cars to the same open spot?
+How would you scale this to 10M sensors across multiple cities?
+What's your strategy for backfilling 2 years of historical data if you change the H3 resolution?
+How would you handle private lots that want to share data with only specific apps?
+Improvement Areas
+
+Articulate the serving-tier separation between Redis (real-time) and analytical stores
+Practice explaining stateful stream processing in Flink (keyed state, watermarks, timers)
+Deepen knowledge of geospatial indexing trade-offs (H3 vs S2 vs geohash)
+Build vocabulary around data freshness SLAs and how to measure them end-to-end
+
+
+-----------------------------------------------------------------------------------------------------------
+
+Suggested Improvements
+
+high
+MEDIUM
+Add Redis (or DynamoDB) as the real-time serving store. Flink writes aggregated availability per lot/zone to Redis; navigation apps query Redis with single-digit ms latency, satisfying the <5s freshness SLA.
+
+Understand the importance of a dedicated low-latency serving tier separate from analytical stores. Redshift is not suited for high-QPS point lookups from mobile apps.
+
+Redis
+DynamoDB
+ElastiCache
+high
+MEDIUM
+Add explicit stale sensor detection in Flink using keyed timers. If a sensor's last event is >10 min old, emit a 'stale' status downstream so the availability count excludes it and the app shows 'unknown.'
+
+Learn Flink's stateful stream processing primitives (keyed state, timers) for handling missing-event scenarios common in IoT.
+
+Flink KeyedProcessFunction
+Flink Timers
+medium
+MEDIUM
+Add an orchestration layer (Airflow, Dagster, or Databricks Workflows) for the hourly heatmap tile generation job reading from partitioned Parquet/Delta.
+
+Understand how streaming and batch pipelines coexist; orchestration handles dependencies, retries, and backfills that streaming can't.
+
+Airflow
+Dagster
+Databricks Workflows
+medium
+MEDIUM
+Replace API Gateway with AWS IoT Core for MQTT ingestion. IoT Core offers device shadows (useful for stale sensor detection), per-device certificates, and is purpose-built for sensor fleets.
+
+Learn the IoT-specific ingestion patterns and how device shadows simplify offline-handling logic.
+
+AWS IoT Core
+MQTT
+Device Shadows
+medium
+MEDIUM
+Add a monitoring/observability layer tracking sensor online %, Flink job lag, freshness SLA, and Kinesis iterator age. Alert when stale sensor % exceeds threshold.
+
+Observability is critical for IoT pipelines where silent failures are common. Build muscle around defining SLOs and SLIs.
+
+CloudWatch
+Grafana
+Datadog
+Prometheus
+low
+HARD
+Add a schema registry for sensor payloads to enforce data contracts and enable safe schema evolution.
+
+Schema governance prevents silent data quality issues as sensor firmware evolves.
+
+AWS Glue Schema Registry
+Confluent Schema Registry
+Learning Path
+
+Strengths
+
+Strong capacity planning with concrete throughput math
+Correct streaming framework choice (Flink) for windowed aggregation
+Smart partitioning strategy (timestamp + h3_index with Z-order)
+Two-tier analytical storage (OLAP for heatmaps, lakehouse for trends)
+Critical Improvements
+
+Add Redis or DynamoDB as the real-time serving layer between Flink and navigation apps
+Add explicit stale sensor handling in Flink (timer-based detection of sensors silent for >10 min)
+Add orchestration (Airflow/Dagster) for the batch heatmap generation pipeline
+Add monitoring layer for sensor health and pipeline SLAs
+Next Level
+
+Schema registry and data contracts for sensor payloads
+Multi-region replication for HA at city/metro scale
+Advanced geospatial: H3 hierarchical aggregation for variable zoom levels
+CDC and event sourcing patterns for auditability
+Advanced Concepts
+
+Lambda vs Kappa architecture trade-offs for IoT workloads
+Watermarks and event-time processing in Flink
+Data mesh for multi-tenant city data sharing
+Predictive availability using ML on historical occupancy patterns
+Pattern Recommendations
+
+Recommended Patterns
+
+Hot/cold storage tiering (Redis hot, Delta Lake cold)
+Lambda architecture for explicit batch heatmap + streaming availability split
+Hierarchical geospatial aggregation (spot → lot → zone → city) via H3 parent indices
+Materialized view pattern in Redshift for heatmap queries
+Anti-patterns to Avoid
+
+Serving navigation apps directly from Redshift (high latency, wrong tool for point lookups)
+Treating offline sensors as 'occupied' or 'available' without stale detection
+Running batch jobs without orchestration (manual/cron-based brittleness)
