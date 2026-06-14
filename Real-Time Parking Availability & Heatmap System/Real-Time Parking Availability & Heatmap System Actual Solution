@@ -1,0 +1,150 @@
+Let's build this parking system step by step, thinking like a maps engineer. We'll follow a sensor update from the moment it arrives to updating navigation apps — and then zoom out to see how city planners get their heatmaps. Every component has a reason for being there, especially when 5% of sensors are always broken.
+
+1
+What happens when a sensor reports?
+A parking sensor detects a car leaving or arriving. It sends an update: {"spot_id": "SF_MISSION_001", "status": "occupied", "timestamp": "2024-01-15T14:30:15Z"}. We have 5 seconds to update availability counts and push to navigation apps. That's our freshness budget.
+
+The Entry Point: IoT Gateway
+Sensors send updates via cellular or WiFi to an IoT Gateway (AWS IoT Core or Google Cloud IoT). The gateway handles authentication, deduplication, and basic validation. If a sensor sends the same status twice in a row, we drop the duplicate.
+
+Why an IoT Gateway instead of direct HTTP? Scale and reliability. 50,000 sensors × 2 updates/minute = 100K events/minute. The gateway batches these efficiently and handles connection pooling. It also deals with sensors that go offline and reconnect — buffering messages during network hiccups.
+
+The gateway publishes validated updates to a Kafka topic (parking-sensor-updates). Each message includes the spot_id, new status, timestamp, and sensor metadata.
+
+Latency budget used: ~500ms (cellular network + gateway processing)
+2
+How do we process 100K sensor updates per minute?
+Raw sensor data isn't useful to navigation apps. They need aggregated counts: "Lot A has 15 available spots" or "Mission District has 200+ spots." We need real-time aggregation that handles sensor failures gracefully.
+
+The Streaming Aggregation Pipeline (Flink + Kafka)
+A Flink streaming job consumes from parking-sensor-updates and maintains running counts at multiple geographic levels. For each sensor update, it:
+
+1
+Updates spot-level status in state
+2
+Detects stale sensors (no update in 10+ minutes)
+3
+Aggregates to lot level: count available/occupied/unknown spots per lot
+4
+Aggregates to zone level: count available spots per H3 hex or city zone
+5
+Publishes updates to parking-availability-updates topic
+The key insight: we track three states per spot — occupied, available, and unknown (stale sensor). Navigation apps handle "unknown" differently than "occupied."
+
+Why Flink over Spark Streaming? Exactly-once processing and low latency. If the job restarts, we don't double-count sensor updates. Flink's state management keeps aggregation counts consistent even during failures.
+
+Latency budget used: ~1 second (stream processing + aggregation)
+3
+Where do navigation apps get real-time availability?
+Navigation apps need fast lookups: "How many spots are available near 37.7749, -122.4194?" They can't wait for database queries. We need a serving layer optimized for geographic range queries.
+
+The Real-Time Serving Layer (Redis + Geospatial Indexing)
+The Flink job writes aggregated counts to Redis using geospatial keys. We store availability at two levels:
+
+Lot-level availability (for detailed views):
+
+lot:SF_MISSION_LOT_A = {"available": 15, "occupied": 45, "unknown": 3, "last_update": "2024-01-15T14:30:20Z"}
+Zone-level availability (for city-wide views):
+
+zone:h3_8_872830828ffffff = {"available": 234, "occupied": 1456, "unknown": 67}
+Navigation apps query by geographic radius: GEORADIUS parking_zones -122.4194 37.7749 1000m. Redis returns all zones within 1km, with their availability counts.
+
+Why Redis over a traditional database? Sub-millisecond lookups and built-in geospatial indexing. A PostGIS query would take 10-50ms. When users are driving and need instant results, every millisecond matters.
+
+Latency budget used: ~100ms (API call + Redis lookup + response)
+4
+How do we handle the 5% of broken sensors?
+Sensors break, lose connectivity, or get stuck reporting the same status. If we naively trust all sensor data, we'd show phantom availability or permanent "occupied" spots. We need smart stale data detection.
+
+The Sensor Health Monitor (Flink Side Output)
+The same Flink job that aggregates availability also monitors sensor health. For each sensor, it tracks:
+
+Last seen timestamp: when did we last hear from this sensor?
+Status change frequency: is it stuck reporting the same value?
+Heartbeat pattern: does it report every 30 seconds as expected?
+If a sensor hasn't reported in 10 minutes, the job marks its spot as "unknown" and excludes it from availability counts. It also publishes an alert to sensor-health-alerts for the operations team.
+
+The health monitor uses Flink's ProcessFunction with timers. When a sensor reports, we set a 10-minute timer. If the timer fires before the next update, we mark the sensor as stale.
+
+Why 10 minutes instead of 5? False positive prevention. Cellular networks have hiccups. A 10-minute threshold catches truly offline sensors without flagging temporary network issues.
+
+5
+How do city planners get their heatmaps?
+Real-time availability is just half the story. City planners need historical patterns: "Which zones are busiest during lunch hours?" and "How has parking demand changed since the new transit line opened?" This requires a different pipeline optimized for analytical queries.
+
+The Historical Analytics Pipeline (Hourly Batch + Parquet)
+Every hour, an Airflow DAG runs a batch job that:
+
+1
+Reads raw sensor data from the last hour (stored in S3 from Kafka)
+2
+Computes occupancy statistics per zone per hour
+3
+Generates heatmap tiles as pre-rendered images or GeoJSON
+4
+Stores results in Parquet files partitioned by date/hour/zone
+The batch job uses Spark to process large volumes efficiently. It computes metrics like:
+
+Average occupancy percentage per zone per hour
+Peak occupancy times per zone
+Day-of-week patterns
+Seasonal trends (comparing to same period last year)
+Why batch instead of real-time for analytics? Cost and complexity. Heatmaps don't need second-by-second updates. Hourly is fine for planning purposes, and batch processing is much cheaper than keeping a large streaming job running 24/7.
+
+Storage format: Parquet files in S3, partitioned by year=2024/month=01/day=15/hour=14/. This enables fast queries like "show me occupancy patterns for downtown during lunch hours in January."
+
+6
+How do we serve heatmaps to the planning dashboard?
+City planners want interactive heatmaps: "Show me average occupancy last Tuesday from 2-4 PM" with drill-down by zone. They need fast queries over historical data.
+
+The Analytics Serving Layer (Snowflake + Grafana)
+The Parquet files get loaded into Snowflake (or BigQuery) for interactive querying. The planning dashboard uses Grafana with a Snowflake data source to create:
+
+Time-series charts: occupancy trends over weeks/months
+Geographic heatmaps: color-coded zones by occupancy percentage
+Comparative analysis: this month vs. last month, weekday vs. weekend
+Pre-computed heatmap tiles (generated by the batch job) are served from S3 + CloudFront for fast loading. The dashboard overlays these tiles on an interactive map.
+
+Why Snowflake over a data lake? Query performance and ease of use. City planners aren't data engineers. They need SQL queries that run in seconds, not minutes. Snowflake's automatic clustering and caching make ad-hoc analysis fast.
+
+7
+What about special events and edge cases?
+Real cities have complications: street cleaning that temporarily removes all cars, private lots with restricted access, and events that change normal patterns.
+
+The Event Management System
+We maintain an Events API that lets city operators mark temporary changes:
+
+Street cleaning: mark a zone as "temporarily unavailable" from 8-10 AM
+Private lot integration: some lots share availability only with partner apps
+Event overrides: during a baseball game, mark nearby zones as "high demand"
+The Flink job consumes from an parking-events topic and applies these overrides to availability calculations. Navigation apps get context: "Limited availability due to street cleaning until 10 AM."
+
+8
+Let's verify — does the architecture meet the requirements?
+Scale: ✅ 100K events/minute is well within Kafka + Flink capacity
+
+Latency: ✅ 5-second freshness budget met (500ms + 1s + 100ms + buffer)
+
+Reliability: ✅ Stale sensor detection prevents phantom availability
+
+Geospatial: ✅ H3 indexing enables efficient zone-level aggregation
+
+Historical: ✅ 2 years of data in Parquet, queryable via Snowflake
+
+Failure handling: ✅ Unknown status for offline sensors, health monitoring
+
+9
+Data Flow Summary
+1
+Sensor → IoT Gateway → Kafka (parking-sensor-updates)
+2
+Flink consumes, aggregates, detects stale sensors
+3
+Real-time path: Flink → Redis → Navigation Apps (5-second freshness)
+4
+Historical path: Kafka → S3 → Hourly Batch → Parquet → Snowflake
+5
+Analytics: Grafana dashboard + pre-rendered heatmap tiles
+6
+Operations: Sensor health alerts → PagerDuty → Field technicians
+The beauty of this architecture? Separation of concerns. Real-time serving optimizes for speed. Historical analytics optimizes for complex queries. Each component does one thing well, and the system gracefully handles the messy reality of broken sensors and urban complexity.
