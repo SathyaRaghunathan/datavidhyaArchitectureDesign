@@ -8,8 +8,8 @@ Design the architecture. Your diagram should clearly show:
 
     -Ingest sensor updates from 50,000+ parking spots (every 30 seconds per sensor): MQTT
     -Maintain real-time availability counts per parking lot and zone : flink or sparkstreaming with in-memory (redis)
-    -Serve availability to navigation apps with < 5-second freshness
-    -Generate occupancy heatmaps using time-partitioned geospatial data: in Redis use geospatial lookup (sorted sets): Navigation apps querying "Find parking near me" utlizee Redis GEO command or H3 string matching
+    -Serve availability to navigation apps with < 5-second freshness: Done using kinesis datastreams/firehose
+    -Generate occupancy heatmaps using time-partitioned geospatial data: in Redis use geospatial lookup (sorted sets): Navigation apps querying "Find parking near me" utilize Redis GEO command or H3 string matching
     -Handle sensor failures (stuck sensors, offline sensors) gracefully: 1. update redis with TTL set to 90 seconds. A backgroudn worker or Flink monitors expired heartbeats and if the TTL expires, its flagged as OFFLINE. When its offline, subtract it from total active pool. If a sensor reports status:1 (occupied) continuosly for more than 48 hours without a single fluctuation, an anomaly flag is trigged via an analytical query 
     -Historical analytics — peak hours, average occupancy by zone, seasonal patterns: This requires a long-term historical data flow with a decoupled storage pipeline
     
@@ -21,14 +21,14 @@ Design the architecture. Your diagram should clearly show:
     -Storage: 2 years of historical occupancy data for trend analysis
 
     Storage & Lakehosue Architecture
-    1. Kafka connect/firehose: consumes data from kafka, batches it for 5 minutes, converts it to raw yaloads into Parquet and write to object storage
+    1. Kafka connect/firehose: consumes data from kafka, batches it for 5 minutes, converts it to raw payloads into Parquet and write to object storage
     2. Physical partitioning Schema: partition files spatially and temporally IE. s3://parking-analytics/year=2026/month=06/day=12/h3_res4=8426/
 
     Serving real-time heatmaps
-    -   feed the parquet files into an OLAP database like ClickHouse but because h3 indexes are stores as 64 big integers, clickhouse can aggregate millions of rows across spatial grids using fast bitwise operations to generate instantatneous map visualization layers
+    -   feed the parquet files into an OLAP database like ClickHouse/redshift but because h3 indexes are stores as 64 big integers, clickhouse/redshift can aggregate millions of rows across spatial grids using fast bitwise operations to generate instantaneous map visualization layers
 
     2 year historical analytics
-    For deep trend analysis (trainig ML church/occupancy models, evaluate seasonal patterns). Use z-order on timestamp and h3_index. To keep query performance fast over a 2 year window, a scheduled dbt or spark batch job will truncate raw data into hourly and daily summary tables.
+    For deep trend analysis (trainig ML churn/occupancy models, evaluate seasonal patterns). Use z-order on timestamp and h3_index. To keep query performance fast over a 2 year window, a scheduled dbt or spark batch job will truncate raw data into hourly and daily summary tables.
 
 
 Notes:
@@ -69,7 +69,7 @@ H3 vs geohash
 
             HTTP - used by WWW for defining how its messages are going to be transmitted and formatted. Its responsible for the action that a server has to take while sending information over the network.
 
-        2. You also need an API gateway/load balancer. 
+        2. You also need an API gateway (amazon API Gateway)/load balancer (API gateway direct integration with Private load balancer). 
             This will execute TLS Termination which decrypts the payload using your SSL/TLS certificates and passes the raw HTTP traffic to your internal network.This also helps simplify networking because your internal services (running inside a secure VPC or kubernetes cluster) can communicate over standard HTTP/gRPC. 
             
             Token Auth (validates JWT/drops bad requests) - inspects the incoming requests headers for an authorization token (like OAuth2 JWT or an API Key). If the token signature and expiration date are invalid, it sends a 401 unauthorized status. It helps get authenticayed telemetry data entering bronze/raw data layer. An advanced API gateway can decode a valid JWT, extract metadata and inject those fields into HTTP headers before forwarding it. Your ingestion script can grab those headers and append them to the record, giving you authomated data lineage and partition keys at ingestion point.
@@ -85,12 +85,22 @@ H3 vs geohash
                 Event Hubs scales using Throughput Units, where 1 TU is 1MB/s so 1000 events/sec. We would provision 2 TUs. Enable the Capture feature on Event Hubs, this automatically streams the incoming sensor data directly into Azure Blob Storage or Azure Data Lake Storage (ADLS) Gen2 in Avro or Parquet format with zero code.
 
             Suggestion C: Cloud-agnostic Kafka or AWS MSK
-                Create 2 topics (e.g. parking-sensor-events,dead-letter-queue) partitioned across 2 or 3 partitions with 7 day rentention to distribute the load across brokers and alllow for parallel downstream consumption. Use the official Kafka Connect farmework with an s3,GCS or azure blobg storage sink connector. kafka connect runs as a distributed cluster of workers that pulls data from Kafka partitions and flushes it to your object store landing layer in batches.
+                Create 2 topics (e.g. parking-sensor-events,dead-letter-queue) partitioned across 2 or 3 partitions with 7 day rentention to distribute the load across brokers and allow for parallel downstream consumption. Use the official Kafka Connect farmework with an s3,GCS or azure blob storage sink connector. kafka connect runs as a distributed cluster of workers that pulls data from Kafka partitions and flushes it to your object store landing layer in batches.
 
             Suggestions:
-                - avoid the small file problem, if you write 1667 files every second directly to s3, your downstream query engines will grind to a halt/ Ensure your streaming ingestion tool IE. firehose, event hubs capture, kafka connect is configured to buffer/batch data and set a threshold to flush files either every 1-5 minutes or when the file size reaches 10MB - 50MBs.
+                - avoid the small file problem, if you write 1667 files every second directly to s3, your downstream query engines will grind to a halt. Ensure your streaming ingestion tool IE. firehose, event hubs capture, kafka connect is configured to buffer/batch data and set a threshold to flush files either every 1-5 minutes or when the file size reaches 10MB - 50MBs.
 
                 - partioning strategy: Since parking data is temporal and spatial, partition your landing layer using Hive partition at the bucket level IE. s3://parking-data-landing/year=2026/month=06/day=12/hour=11/
                 You can even pre-calculate a course geohas or h3 index and include it in your partition path IE. s3://parking-data-landing/year=2026/month=06/day=12/h3_r4=8426/
 
+                -Flink: 
+                -   True heavy-duty execution engine (the computation layer). True low-latency stream processing. Spark streaming uses micro-batching where the engine collects event for 500 ms or 1 second, spins up a task and processes the batch and writes it out. Flink handles the data event-by-event. The flink consumer pulls data from kafka/kinesis partitions as soon as its available, processes each record through your DAG with sub-second end-to-end latency. It can calculate ongoing metrics IE. 30 minute rolling average of IOT sensor or tracking user sessions across days. You can do this with stateless lambda functions, you need memory. 
+                
+                -   Flink mains state locally within the worker node's memory (embedded state) and it can scale independent of state because finlk maps its parallel works directly to kafka/kinesis partitions IE. 1 TaskSlot consuming from 1 Kafka partition, it manages its local state without constantly fetching or writeing to an external cache like Redis, eliminating massive network overheard.
+
+                -   Kafka/kinesis with flinks checkpointing mechanism is what allows you to achieve hte holy grail fo streaming. Exactly once processing. Flink periodically injects a "checkpoint barrier" into a stream alongside your data records. This barrier flows through your streaming graph. It takes state snapshots. IE. when a window aggregation encounters the barrier, it logs its current internal state to a durable object store and records the exact kafka/kinesis partition offsets associated with that barrier.
+
+                -If a worker node crashes mid-stream, Flink restarts the topology, initializes the application state from the last successful checkpoint in S3, and tells the Kafka/Kinesis consumer to rewind its partition offset back to that exact barrier point. No data is lost, and no aggregates are double-counted.
+
+                - Solves out of order data. If iOt sensors go offline, flink separates Processing Time vs Event time. Watermarks: flink uses a concept called watermarks to track tiem progression. It's a control signal embedded in the steram that tells Flink "you can confidently assume no more records with arrive with an event timestamp earlier than X". It also allows lateness IE. keep this 10 minute window open for an extra 2 minutes in case kafka receive late-arrive events.
 
