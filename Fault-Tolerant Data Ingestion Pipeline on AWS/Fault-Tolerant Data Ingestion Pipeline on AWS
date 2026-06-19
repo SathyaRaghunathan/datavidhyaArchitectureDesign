@@ -1,0 +1,127 @@
+Scenario
+You're interviewing for a data engineering role at Amazon. The interviewer says:
+
+"We have 15+ upstream data sources feeding our analytics warehouse — application databases, third-party APIs, log files, Kafka streams.
+ Right now, when something fails, data just silently goes missing.
+Analysts discover gaps days later. 
+I want you to design a fault-tolerant data ingestion pipeline on AWS that guarantees zero data loss and no duplicates.
+Walk me through the full architecture."
+
+Your Task
+Design the architecture. Your diagram should clearly show:
+
+    Ingest from multiple source types — application databases (CDC), REST APIs (pull), S3 file drops (push), 
+    Kafka streams
+    Stage raw data in S3 before transformation
+    Transform using AWS Glue or EMR Spark
+    Load into Redshift/Athena for analyst consumption
+    Handle schema mismatches between producers gracefully
+    Provide end-to-end data completeness monitoring
+
+Scale & Constraints
+    Scale: 500GB - 2TB daily ingestion across all sources
+    Latency: Data available in warehouse within 4 hours of generation
+    Reliability: Zero data loss tolerance, at-most-once deduplication
+    Cost: Optimize between Glue, EMR, and Lambda for different data volumes
+    Some sources have unpredictable delivery times (up to 6 hours late)
+
+Notes:
+    How to pull from databases:
+        Understand connectivity to scalability, performance optimization, resouce
+        management and security.From here decide whether its real-time streaming, 
+        bulk analytics loading (OLAP) or micro-batch transactional reads (OLTP).
+
+        Decide how to extract the data based on downstream SLA requirements.
+            1.Bulk/Full Dump - for small tables
+            2. incremental (watermarking) - pull data based on high-watermark column
+            IE.updated_at or auto-incrementing id 
+            3. CDC - great for high-throughput OLTP. You read the database's transactional
+            logs using AWS Database Migration Service. This has near-zero impact on the
+            source database CPU/memory and captures inserts, updates and deletes in realtime.
+
+        Optimizing the Extraction Framework
+            Pulling from an orchestration pipeline usign compute enginer, you must optimize the extraction layout.
+             Parallelism: using a single JDBC connection to pull 500 milion rows will OOM your driver/throttle
+             the database. Partitiont he JDC across multiple workers.**Make sure the partition column is indexed
+             in the source database or the DB will perform 10 full table scans
+
+        Protecting the Source System
+            Always point to read replicas. If you have to query an operational DB, use appropriate isolation levels.
+            IE. SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED or WITH (NOLOCK) to prevent read queries
+            from blocking incoming application.
+            Query pushdown/predicate pushdown. Filter the data at hte source instead of pulling an entire table into spark
+        
+        Security and Governance:
+            Credential Management: passwords/connection strings are never hardcoded or checked into Git.
+            They are fetched dynamically at runtime from secret managers.
+            Least Privilege Access
+            Data Masking: if the db contains PII, it should be filtered our at the source/masked/hashed
+
+---------------------------------------------------------------------------------------------------------------------
+    When designing ingestion architecture, consider operational overhead, schema evolution, backpressure handling,
+    cost-effectiveness and data governance.
+
+    [OLTP DB]        -->  AWS DMS (CDC)       --> [ S3 Landing Zone ] 
+    [REST APIs]      -->  EventBridge / Lambda --> [   (Raw Parquet/   ] --> AWS Glue / Iceberg
+    [S3 File Drop]   -->  S3 Event / EventBridge-> [     Avro/JSON)    ]
+                                                     ^
+    [Kafka Streams]  -->  MSK Connect / Kinesis  --------+
+
+    1. Database ingestion (CDC)
+        For high-throughput operational databases, you want to avoid polling queries. Use DMS
+        (Database Migration Service) using CDC mode, self-hosted on EKS/MSK.
+        DMS attaches to teh srouces DB transaction log and streams changes. The target should be s3 landing zone,
+        writing out micr-batches of data in parquet format and partitions by table and date (HIVE partitioning).
+
+        Ensure DMS is set to log DDL changes and pair this with Glue scheam registry to ensure downstream applications
+        don't break when a column type changes.
+    
+    2. REST API Ingestion (pull based)
+        REST Apis have unpredicatable rate limits, network latency and pagination challenges. You need serverless, decoupled pulling mechanism.
+        Tool: Amazon Eventbridge or Amazon SQS
+        Architecture: EventBridge scheduler fires a cron-like event. This triggers an orchestrator lambda function,
+        that calculates pagination/date token and pushes chunked metadata requests into an SQS FIFO queue.
+        A worker lambda consumes from SQS, pulls the actual data from third0party REST API, handles rate-limiting backpressure gracefully and dumps raw JSON response straight into the s3 landing zone.
+        If API payload is massive and takes >15 minutes, swap lambda for a step functions workflow spinning up lightweight ECS fargate task.
+
+    3. S3 File Drop (push-based/event-driven)
+        When a vendor push files into a dedicated s3 bucket, your architecture must respond immediately and idempotently.
+        Tool: S3 event notifications, eventbridge, lambda or glue
+        Architecture: 1. vendor uploads a file to s3
+        2. An s3 ObjectCreated event is directly emited to eventbridge/lambda triggers
+        3. Event bridge routes the event to an SQS queue
+        4. Lambda function or glue job processes the event, validates the file schema, logs the metadata for auditing
+        and moves the file into the main s3 landing zone.
+
+        Idempotency: implement a mechanism (DynamoDB lock table checkign file md5 hashes) to ensure that if the vendor drops
+        the exact file twice, its not processed twice.
+        Isolate: Vendor has access to bucket with strict bucket policies
+
+    4. Kafka streams
+        You want zero-code, low-code managed pipeline to move the data to your storage tier.
+        Tool: MSK (kafka), MSK Connect or firehose
+        Architecture: 
+        a. MSK connect clsuter running the official s3 sink connector. It scales automatically based on CPU worker
+        utilization and streams bytes straight from the kafka topics into s3, sinking data based on time/file size thresholds.
+        b. Kinesis Data Streams, hook up firehose. It automatically batches streaming data, applies lightweight transoformation
+        lambda functions if neede (ie. parsing raw strings to json), compresses it (GZIP/snappy) and dumps it into s3.
+
+        Partition Tuning; ensure your s3 prefix output matches your query patterns. Format conversion - configure firehose/msk connect to automatically convert raw JSON to parquet before writing to s3, usign glue data catalog schema
+
+    The unified target: Open Table Formats
+        Write a secondary processing layer (Glue/AMR) that reads from unified s3 landing zone and writes data into an
+        open table format like Iceberg
+
+        [S3 Landing Zone] ---> [AWS Glue ETL / Spark] ---> [S3 Data Lakehouse (Apache Iceberg)]
+                                                           |
+                                                   [AWS Glue Catalog]
+                                                           |
+                                                [Amazon Athena / Redshift]
+
+        
+    small-file problem = performance bottleneck where streaming systems write continuous flows of data as thousands of tiny,
+    fragmented files isntead of larger ones. Produces too much metadata.
+    Solution: 1. Compaction: run routine batch jobs usign continuous background services to combine small files into
+    128 MB + sizes. Iceberg and Delta lake feature built in optimzation commands like OPTIMIZE
+    2. Buffer and write smarter: Tune steraming jobs to buffer data for a slightly longer duration before comming/use
+    partitioning strategies designed to evenly distribute incoming streams.
