@@ -1,9 +1,7 @@
 Scenario
 You're interviewing for a data engineering role at Amazon. The interviewer says:
 
-"We have 15+ upstream data sources feeding our analytics warehouse — application databases, third-party APIs, log files, Kafka streams.
- Right now, when something fails, data just silently goes missing.
-Analysts discover gaps days later. 
+"We have 15+ upstream data sources feeding our analytics warehouse — application databases, third-party APIs, log files, Kafka streams. Right now, when something fails, data just silently goes missing. Analysts discover gaps days later. 
 I want you to design a fault-tolerant data ingestion pipeline on AWS that guarantees zero data loss and no duplicates.
 Walk me through the full architecture."
 
@@ -32,7 +30,7 @@ Notes:
         bulk analytics loading (OLAP) or micro-batch transactional reads (OLTP).
 
         Decide how to extract the data based on downstream SLA requirements.
-            1.Bulk/Full Dump - for small tables
+            1. Bulk/Full Dump - for small tables
             2. incremental (watermarking) - pull data based on high-watermark column
             IE.updated_at or auto-incrementing id 
             3. CDC - great for high-throughput OLTP. You read the database's transactional
@@ -40,16 +38,16 @@ Notes:
             source database CPU/memory and captures inserts, updates and deletes in realtime.
 
         Optimizing the Extraction Framework
-            Pulling from an orchestration pipeline usign compute enginer, you must optimize the extraction layout.
+            Pulling from an orchestration pipeline using compute engine, you must optimize the extraction layout.
              Parallelism: using a single JDBC connection to pull 500 milion rows will OOM your driver/throttle
-             the database. Partitiont he JDC across multiple workers.**Make sure the partition column is indexed
+             the database. Partition the JDC across multiple workers.**Make sure the partition column is indexed
              in the source database or the DB will perform 10 full table scans
 
         Protecting the Source System
             Always point to read replicas. If you have to query an operational DB, use appropriate isolation levels.
             IE. SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED or WITH (NOLOCK) to prevent read queries
             from blocking incoming application.
-            Query pushdown/predicate pushdown. Filter the data at hte source instead of pulling an entire table into spark
+            Query pushdown/predicate pushdown. Filter the data at the source instead of pulling an entire table into spark
         
         Security and Governance:
             Credential Management: passwords/connection strings are never hardcoded or checked into Git.
@@ -70,10 +68,10 @@ Notes:
     1. Database ingestion (CDC)
         For high-throughput operational databases, you want to avoid polling queries. Use DMS
         (Database Migration Service) using CDC mode, self-hosted on EKS/MSK.
-        DMS attaches to teh srouces DB transaction log and streams changes. The target should be s3 landing zone,
-        writing out micr-batches of data in parquet format and partitions by table and date (HIVE partitioning).
+        DMS attaches to the sources DB transaction log and streams changes. The target should be s3 landing zone,
+        writing out micro-batches of data in parquet format and partitions by table and date (HIVE partitioning).
 
-        Ensure DMS is set to log DDL changes and pair this with Glue scheam registry to ensure downstream applications
+        Ensure DMS is set to log DDL changes and pair this with Glue schema registry to ensure downstream applications
         don't break when a column type changes.
     
     2. REST API Ingestion (pull based)
@@ -81,7 +79,7 @@ Notes:
         Tool: Amazon Eventbridge or Amazon SQS
         Architecture: EventBridge scheduler fires a cron-like event. This triggers an orchestrator lambda function,
         that calculates pagination/date token and pushes chunked metadata requests into an SQS FIFO queue.
-        A worker lambda consumes from SQS, pulls the actual data from third0party REST API, handles rate-limiting backpressure gracefully and dumps raw JSON response straight into the s3 landing zone.
+        A worker lambda consumes from SQS, pulls the actual data from third party REST API, handles rate-limiting backpressure gracefully and dumps raw JSON response straight into the s3 landing zone.
         If API payload is massive and takes >15 minutes, swap lambda for a step functions workflow spinning up lightweight ECS fargate task.
 
     3. S3 File Drop (push-based/event-driven)
