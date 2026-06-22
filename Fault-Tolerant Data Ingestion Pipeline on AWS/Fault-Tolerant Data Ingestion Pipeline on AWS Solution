@@ -1,0 +1,262 @@
+Let's build this bulletproof ingestion pipeline step by step, thinking like a data engineer who's been burned by silent failures before. We'll follow data from 15 different sources all the way to the analyst's dashboard — and make sure nothing gets lost along the way. Every component has a backup plan.
+
+1
+What are we actually ingesting?
+Before we architect anything, let's map out these 15 sources. They're not all the same beast:
+
+Continuous streams: Database CDC via Kinesis Data Streams, application logs via Kinesis Firehose
+
+Scheduled batches: Third-party APIs delivering daily/hourly files, internal ETL jobs dropping CSVs
+
+Event-driven: S3 file drops from partners, Kafka streams from microservices
+
+Pull-based: REST APIs we need to poll every hour
+
+Each source type needs different handling. A CDC stream never stops flowing, but an API might be down for maintenance. A file drop is atomic (complete or not), but a stream can have partial failures. Our architecture needs to handle all of these gracefully.
+
+Scale reality check: 500GB-2TB daily means roughly 6-23MB/second average, but sources are bursty. That morning API batch might dump 200GB in 30 minutes.
+
+2
+Where does all this data land first?
+Everything goes to S3 first. No exceptions. S3 is our staging area, our source of truth, and our recovery mechanism all in one.
+
+The S3 Staging Architecture
+We organize raw data with a specific folder structure that makes debugging and reprocessing possible:
+
+s3://data-ingestion-staging/
+├── source=database_cdc/year=2024/month=03/day=15/hour=14/
+├── source=partner_api/year=2024/month=03/day=15/batch_id=morning/
+├── source=kafka_events/year=2024/month=03/day=15/hour=14/
+└── source=file_drops/year=2024/month=03/day=15/file_id=12345/
+Why this structure? Time-based partitioning lets us reprocess specific time windows. Source-based partitioning lets us handle schema changes per source. Batch/file IDs give us atomic units for retry logic.
+
+Each source writes to its own prefix with server-side encryption and versioning enabled. If someone accidentally deletes a file, we can recover it. If a Glue job corrupts data during transformation, we can reprocess from the original.
+
+Storage classes: Raw data starts in Standard, moves to IA after 30 days, then Glacier after 90 days. We keep everything for compliance, but optimize costs.
+
+3
+How do we get data from each source type?
+Different sources need different ingestion patterns. Let's walk through each:
+
+Database CDC: Kinesis Data Streams + Lambda
+For application databases, we use AWS DMS to capture changes and stream them to Kinesis Data Streams. A Lambda function consumes from Kinesis and writes JSON files to S3 every 5 minutes or 10MB, whichever comes first.
+
+Why Lambda instead of Kinesis Firehose directly? Control. Lambda lets us add metadata (ingestion timestamp, source database, schema version) and handle schema changes gracefully. If a new column appears, Lambda can flag it for review instead of breaking the pipeline.
+
+Failure handling: Lambda has built-in retry with exponential backoff. Failed records go to a dead letter queue (SQS) for manual investigation. DMS has its own retry logic and can resume from the last committed position.
+
+REST APIs: EventBridge + Lambda
+For third-party APIs, we use EventBridge scheduled rules to trigger Lambda functions that poll the APIs. Each API gets its own Lambda to isolate failures.
+
+The Lambda does more than just call the API:
+
+1
+Idempotency check: "Did I already fetch today's data?"
+2
+Completeness validation: "Does the row count match the expected range?"
+3
+Schema validation: "Are all required fields present?"
+4
+Atomic write: Write to S3 with a .tmp extension, then rename to final name
+Why the .tmp dance? Atomic visibility. Downstream processes only see complete files. If Lambda crashes halfway through writing, the incomplete .tmp file gets cleaned up by a separate housekeeping job.
+
+Failure handling: If an API is down, Lambda retries with exponential backoff (1min, 2min, 4min, 8min). After 5 failures, it sends an alert to SNS and writes a failure marker to S3. The next day's run will detect the gap and attempt backfill.
+
+File Drops: S3 Event Notifications
+For partner file drops, we use S3 Event Notifications to trigger Lambda when new files arrive. The Lambda validates the file (size, format, schema) and moves it to the appropriate staging prefix.
+
+Duplicate detection: Files are named with content hashes. If the same file arrives twice, we detect it and skip processing.
+
+Late arrivals: Some partners deliver files up to 6 hours late. We use CloudWatch Events to trigger a "completeness check" job 8 hours after the expected delivery time. If files are missing, we alert and mark the time window as incomplete.
+
+Kafka Streams: Kinesis Data Streams
+For Kafka streams from microservices, we use Kafka Connect with the Kinesis connector to bridge into Kinesis Data Streams. From there, it's the same Lambda pattern as database CDC.
+
+Why not consume Kafka directly in our pipeline? Operational simplicity. Kinesis is fully managed. We don't want to run Kafka consumers in production — one more thing to monitor and scale.
+
+4
+How do we transform all this raw data?
+Raw data in S3 is just the beginning. Now we need to clean, validate, and standardize it for analytics. This is where AWS Glue comes in — but not for everything.
+
+The Transformation Layer: Glue + EMR + Lambda
+We use different tools based on data volume and complexity:
+
+AWS Glue (50-500GB files): Perfect for medium-sized transformations. Serverless, auto-scaling, built-in data catalog integration. Most of our daily batches go through Glue.
+
+EMR Spark (500GB+ files): For the heavy lifting. When a partner dumps 1TB of transaction data, Glue would be expensive and slow. EMR gives us control over cluster size and Spark tuning.
+
+Lambda (< 50GB files): For simple transformations like JSON flattening or CSV parsing. Cheaper than Glue for small files, faster cold start.
+
+The Glue Job Architecture
+Each source gets its own Glue job to handle source-specific transformations:
+
+1
+Schema validation: Check that required columns exist and have expected types
+2
+Data quality checks: Null rates, value ranges, referential integrity
+3
+Standardization: Convert timestamps to UTC, normalize phone numbers, hash PII
+4
+Deduplication: Remove exact duplicates based on business keys
+5
+Partitioning: Write output partitioned by date for efficient querying
+Failure handling: Glue jobs use checkpointing to S3. If a job fails halfway through processing 1000 files, it resumes from file 501, not file 1. Failed records get written to a separate "quarantine" S3 prefix for investigation.
+
+Schema evolution: When a source adds a new column, the Glue job detects it and adds the column to the Glue Data Catalog automatically. Analysts get the new data without pipeline changes.
+
+5
+Where does the clean data go?
+After transformation, we have clean, validated data ready for analytics. But different analysts need different access patterns.
+
+The Analytics Layer: Redshift + Athena
+Amazon Redshift: Our main data warehouse. Gets the most frequently queried datasets — user events, transactions, core business metrics. Data is loaded via COPY commands from S3, with UPSERT logic for slowly changing dimensions.
+
+Amazon Athena: For ad-hoc analysis and less frequent queries. Points directly at S3 using the Glue Data Catalog. Perfect for exploratory analysis and one-off reports.
+
+Why both? Cost optimization. Redshift is expensive but fast for repeated queries. Athena is cheap but slower for complex joins. We put hot data in Redshift, cold data stays in S3 for Athena.
+
+Loading Strategy: Micro-batches
+We don't wait for all sources to complete before loading. Instead, we use micro-batches every 30 minutes:
+
+1
+Glue crawler updates the data catalog with new partitions
+2
+Lambda function checks which sources have new data
+3
+Redshift COPY jobs load only the new partitions
+4
+Data quality checks run on the newly loaded data
+This gives us incremental freshness. If 14 out of 15 sources are ready, analysts get 93% of their data within 30 minutes. The 15th source loads when it's ready.
+
+6
+How do we guarantee zero data loss?
+This is the critical requirement. "Zero data loss" means we need end-to-end tracking and reconciliation.
+
+Data Completeness Monitoring
+Every ingestion creates a manifest record in DynamoDB:
+
+{
+  "source": "partner_api_transactions",
+  "date": "2024-03-15",
+  "expected_files": 4,
+  "received_files": 4,
+  "expected_rows": 1250000,
+  "processed_rows": 1248750,
+  "status": "INCOMPLETE",
+  "missing_rows_reason": "2250 rows failed validation"
+}
+A CloudWatch scheduled Lambda runs every hour to check completeness:
+
+Are all expected files present?
+Do row counts match source system counts?
+Are there any files in quarantine?
+Are any Glue jobs stuck or failed?
+Alerting: Incomplete data triggers SNS notifications to the data engineering team. Critical sources (revenue data) page immediately. Non-critical sources (marketing attribution) can wait until business hours.
+
+Reconciliation with Source Systems
+For database sources, we run row count reconciliation daily:
+
+1
+Query source database for yesterday's row count
+2
+Query Redshift for yesterday's loaded row count
+3
+Compare and alert on any discrepancies > 0.1%
+For API sources, we validate against control totals provided by partners. If they say "we sent you 1M records," we verify we processed exactly 1M.
+
+Reprocessing Capabilities
+When data goes missing, we need to backfill quickly:
+
+Time-based reprocessing: "Reprocess all data from March 10-15"
+
+Source-based reprocessing: "Reprocess only the partner API data from last week"
+
+Selective reprocessing: "Reprocess only the failed records from yesterday"
+
+All reprocessing uses the same Glue jobs, just with different input parameters. The jobs are idempotent — running them twice produces the same result.
+
+7
+What happens when things go wrong?
+Let's walk through some failure scenarios:
+
+Scenario 1: Glue Job Fails Halfway
+A Glue job processing 1000 files crashes on file 501 due to a memory issue.
+
+Recovery: The job's checkpoint shows it completed 500 files. We restart with --start-from-file=501. The job skips already-processed files and continues. Total delay: 10 minutes.
+
+Scenario 2: API Returns Partial Data
+Our morning API call gets 800K records instead of the usual 1M.
+
+Detection: Lambda compares row count to 7-day average (950K-1.05M). 800K is outside the range.
+
+Action: Lambda writes a "partial data" marker to S3 and sends an alert. The data doesn't get promoted to the warehouse until we confirm it's complete or intentionally partial.
+
+Scenario 3: S3 Outage in Primary Region
+AWS S3 in us-east-1 goes down for 2 hours.
+
+Mitigation: Our Kinesis streams have cross-region replication to us-west-2. Lambda functions automatically failover to the backup region. Data continues flowing to the backup S3 bucket. When us-east-1 recovers, we sync the data back.
+
+Scenario 4: Schema Breaking Change
+A source system adds a required field without notice, breaking our Glue job.
+
+Detection: Glue job fails with "missing required column" error.
+
+Recovery: The job writes failed records to quarantine. A schema evolution Lambda detects the new column, updates the Glue catalog, and modifies the job configuration. We reprocess the quarantined data with the updated schema.
+
+8
+How do we optimize costs?
+With 2TB daily ingestion, costs matter. Here's our optimization strategy:
+
+Compute Optimization
+Glue vs EMR decision matrix:
+
+Files < 50GB: Lambda ($0.20 per 1M requests)
+Files 50-500GB: Glue ($0.44 per DPU-hour)
+Files > 500GB: EMR ($0.096 per instance-hour for r5.xlarge)
+EMR optimization: Use Spot instances for non-critical transformations (90% cost savings). Use On-Demand for critical revenue data.
+
+Glue optimization: Use Glue 2.0 with faster startup times. Enable auto-scaling to avoid over-provisioning DPUs.
+
+Storage Optimization
+S3 Intelligent Tiering: Automatically moves infrequently accessed data to cheaper storage classes.
+
+Lifecycle policies:
+
+Raw data: Standard → IA (30 days) → Glacier (90 days)
+Processed data: Standard → IA (7 days) → Glacier (30 days)
+Quarantine data: Standard → IA (7 days) → Delete (90 days)
+Compression: All data stored as Parquet with GZIP compression. 70% size reduction vs JSON.
+
+9
+Let's verify — does the architecture meet the requirements?
+Zero data loss: ✅ End-to-end manifest tracking, reconciliation, and alerting
+
+No duplicates: ✅ Content-based deduplication and idempotent processing
+
+4-hour SLA: ✅ Micro-batch loading every 30 minutes, with 6-hour buffer for late sources
+
+Multiple source types: ✅ Dedicated ingestion patterns for databases, APIs, files, and streams
+
+Schema handling: ✅ Graceful schema evolution with automatic catalog updates
+
+Fault tolerance: ✅ Checkpointing, retry logic, cross-region replication, and dead letter queues
+
+Cost optimization: ✅ Right-sized compute, intelligent storage tiering, and lifecycle policies
+
+10
+Summary: The Complete Data Flow
+Here are all the paths data takes through our pipeline:
+
+1
+Database CDC: DMS → Kinesis → Lambda → S3 → Glue → Redshift/Athena
+2
+REST APIs: EventBridge → Lambda → S3 → Glue → Redshift/Athena
+3
+File drops: S3 Event → Lambda → S3 → Glue → Redshift/Athena
+4
+Kafka streams: Kafka Connect → Kinesis → Lambda → S3 → Glue → Redshift/Athena
+5
+Monitoring: All sources → DynamoDB manifests → CloudWatch → SNS alerts
+6
+Recovery: Failed data → SQS DLQ → Manual investigation → Reprocessing
+The result: A pipeline that never loses data, handles any source type, and fails loudly when something goes wrong. Exactly what you need when analysts depend on your data being complete and correct.

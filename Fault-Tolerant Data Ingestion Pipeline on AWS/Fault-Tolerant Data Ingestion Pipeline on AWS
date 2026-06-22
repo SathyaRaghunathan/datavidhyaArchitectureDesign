@@ -38,7 +38,7 @@ Notes:
             source database CPU/memory and captures inserts, updates and deletes in realtime.
 
         Optimizing the Extraction Framework
-            Pulling from an orchestration pipeline using compute engine, you must optimize the extraction layout.
+             Pulling from an orchestration pipeline using compute engine, you must optimize the extraction layout.
              Parallelism: using a single JDBC connection to pull 500 milion rows will OOM your driver/throttle
              the database. Partition the JDC across multiple workers.**Make sure the partition column is indexed
              in the source database or the DB will perform 10 full table scans
@@ -86,12 +86,12 @@ Notes:
         When a vendor push files into a dedicated s3 bucket, your architecture must respond immediately and idempotently.
         Tool: S3 event notifications, eventbridge, lambda or glue
         Architecture: 1. vendor uploads a file to s3
-        2. An s3 ObjectCreated event is directly emited to eventbridge/lambda triggers
+        2. An s3 ObjectCreated event is directly emitted to eventbridge/lambda triggers
         3. Event bridge routes the event to an SQS queue
         4. Lambda function or glue job processes the event, validates the file schema, logs the metadata for auditing
         and moves the file into the main s3 landing zone.
 
-        Idempotency: implement a mechanism (DynamoDB lock table checkign file md5 hashes) to ensure that if the vendor drops
+        Idempotency: implement a mechanism (DynamoDB lock table checking file md5 hashes) to ensure that if the vendor drops
         the exact file twice, its not processed twice.
         Isolate: Vendor has access to bucket with strict bucket policies
 
@@ -102,7 +102,7 @@ Notes:
         a. MSK connect clsuter running the official s3 sink connector. It scales automatically based on CPU worker
         utilization and streams bytes straight from the kafka topics into s3, sinking data based on time/file size thresholds.
         b. Kinesis Data Streams, hook up firehose. It automatically batches streaming data, applies lightweight transoformation
-        lambda functions if neede (ie. parsing raw strings to json), compresses it (GZIP/snappy) and dumps it into s3.
+        lambda functions if needed (ie. parsing raw strings to json), compresses it (GZIP/snappy) and dumps it into s3.
 
         Partition Tuning; ensure your s3 prefix output matches your query patterns. Format conversion - configure firehose/msk connect to automatically convert raw JSON to parquet before writing to s3, usign glue data catalog schema
 
@@ -118,8 +118,21 @@ Notes:
 
         
     small-file problem = performance bottleneck where streaming systems write continuous flows of data as thousands of tiny,
-    fragmented files isntead of larger ones. Produces too much metadata.
-    Solution: 1. Compaction: run routine batch jobs usign continuous background services to combine small files into
+    fragmented files instead of larger ones. Produces too much metadata.
+    
+    Solution: 
+    1. Compaction: run routine batch jobs usign continuous background services to combine small files into
     128 MB + sizes. Iceberg and Delta lake feature built in optimzation commands like OPTIMIZE
-    2. Buffer and write smarter: Tune steraming jobs to buffer data for a slightly longer duration before comming/use
+    2. Buffer and write smarter: Tune streaming jobs to buffer data for a slightly longer duration before comming/use
     partitioning strategies designed to evenly distribute incoming streams.
+
+    ----------------------------------------------------------------------------------------------------------------
+    To provide end-to-end completeness monitoring, implement a metadata-driven framework that tracks record counts and watermarks across every stage of the pipeline, from source to consumption.Here is how you build a fault-tolerant monitoring architecture:
+        
+        1. Ingestion & Source Tracking Write-Audit-Publish (WAP): Isolate unverified data from your main tables. Only commit data after it passes completeness checks. Metadata Logging: Capture the source system’s payload count, file size, and extract timestamp immediately upon ingestion.
+        
+        2. Processing & Transformation Lineage & Schema Tracking: Use tools to track column-level lineage and enforce schema contracts. If a schema drift causes data loss, halt processing. Watermark Metrics: For streaming data, monitor the difference between event time and processing time. Track event-time delays and dropped late-arriving events.Delta Checks: Compute \(\Delta_{counts} = Source_{count} - Target_{count}\) at every transformation stage to ensure zero data loss.
+        
+        3. Storage & ServingTable Formats: Utilize robust table formats that support atomic commits, snapshot isolation, and ACID compliance to prevent partial writes.Partition Health: Automate audits to verify that all expected hourly or daily partitions are fully loaded and contain the correct volume of data.
+        
+        4. Alerting & Observability Automated Reconciliations: Implement automated, scheduled data diffs between source and target systems. Dynamic Thresholds: Set up automated alerts for volume anomalies. Rather than hard-coding static numbers, use moving averages and statistical process control to account for expected seasonal variations.End-to-End SLAs: Calculate the exact time taken for a record to move from source to destination. Trigger critical alerts if processing pipelines miss their data availability deadlines.
